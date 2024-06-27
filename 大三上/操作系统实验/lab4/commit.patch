@@ -1,0 +1,429 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 59f7aae..b0ecd34 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -108,6 +108,8 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            proc_free_k_pagetable(pagetable_t k_pagetable);
++void            sync_pagetable(pagetable_t user_pagetable,pagetable_t k_pagetable,uint64 start_va,uint64 end_va);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -179,6 +181,15 @@ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
+ int             test_pagetable();
++void            vmprint(pagetable_t);
++pagetable_t     kvminit_new();
++void            kvmmap_new(pagetable_t k_pagetable,uint64 va, uint64 pa, uint64 sz, int perm);
++pte_t           *walk(pagetable_t pagetable, uint64 va, int alloc);
++
++// vmcopyin.c
++int statscopyin (char *buf, int sz);
++int copyin_new  (pagetable_t pagetable, char *dst, uint64 srcva, uint64 len);
++int copyinstr_new   (pagetable_t pagetable, char *dst, uint64 srcva, uint64 max);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 7b8a524..fc1fd62 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -97,6 +97,14 @@ int exec(char *path, char **argv) {
+   p->trapframe->sp = sp;          // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+ 
++  //在第一个进程启动时打印页表信息
++  if(p->pid==1){
++    vmprint(p->pagetable);
++  }
++
++  //在exec()中调用sync_pagetable将改变后的进程页表同步到内核页表中。
++  sync_pagetable(p->pagetable,p->k_pagetable,0,p->sz);
++
+   return argc;  // this ends up in a0, the first argument to main(argc, argv)
+ 
+ bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 292ccb8..1bb027c 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -22,6 +22,7 @@ static void freeproc(struct proc *p);
+ extern char trampoline[];  // trampoline.S
+ 
+ // initialize the proc table at boot time.
++// 修改procinit函数
+ void procinit(void) {
+   struct proc *p;
+ 
+@@ -32,11 +33,17 @@ void procinit(void) {
+     // Allocate a page for the process's kernel stack.
+     // Map it high in memory, followed by an invalid
+     // guard page.
+-    char *pa = kalloc();
++    char *pa = kalloc();            // 分配一个物理页，返回其首地址
+     if (pa == 0) panic("kalloc");
+-    uint64 va = KSTACK((int)(p - proc));
+-    kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+-    p->kstack = va;
++
++    //把procinit()中内核栈的物理地址pa拷贝到PCB新增的成员kstack_pa中
++    p->kstack_pa=(uint64)pa;
++
++    //同时还需要保留内核栈在全局页表kernel_pagetable的映射，在allocproc()中再把它映射到进程的内核页表里
++    uint64 va = KSTACK((int)(p - proc));    
++    kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);    
++    p->kstack = va; 
++
+   }
+   kvminithart();
+ }
+@@ -81,7 +88,10 @@ int allocpid() {
+ // If found, initialize state required to run in the kernel,
+ // and return with p->lock held.
+ // If there are no free procs, or a memory allocation fails, return 0.
++//修改allocproc函数
+ static struct proc *allocproc(void) {
++  //函数功能：在进程表中查找空闲PCB，如果找到，初始化在内核中运行所需的状态，并保持p->lock返回。
++  //如果没有空闲PCB，或者内存分配失败，则返回0。
+   struct proc *p;
+ 
+   for (p = proc; p < &proc[NPROC]; p++) {
+@@ -111,6 +121,11 @@ found:
+     return 0;
+   }
+ 
++  //创建页表之后，调用Step 2创建的函数设置内核页表。
++  p->k_pagetable=kvminit_new();
++  //并且调用kvmmap_new函数将Step 3设置的内核栈映射到页表k_pagetable里。            
++  kvmmap_new(p->k_pagetable,p->kstack, p->kstack_pa, PGSIZE, PTE_R | PTE_W);
++
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+@@ -123,6 +138,7 @@ found:
+ // free a proc structure and the data hanging from it,
+ // including user pages.
+ // p->lock must be held.
++//修改freeproc()函数来释放对应的内核页表
+ static void freeproc(struct proc *p) {
+   if (p->trapframe) kfree((void *)p->trapframe);
+   p->trapframe = 0;
+@@ -136,6 +152,10 @@ static void freeproc(struct proc *p) {
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++
++  //释放内核页表
++  if (p->k_pagetable) proc_free_k_pagetable(p->k_pagetable);
++  p->k_pagetable = 0;
+ }
+ 
+ // Create a user page table for a given process,
+@@ -174,6 +194,24 @@ void proc_freepagetable(pagetable_t pagetable, uint64 sz) {
+   uvmfree(pagetable, sz);
+ }
+ 
++//参考kernel/vm.c中的freewalk，释放内核页表。别忘了在defs.h中加上它
++void proc_free_k_pagetable(pagetable_t k_pagetable) {
++  // there are 2^9 = 512 PTEs in a page table.
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = k_pagetable[i];
++    //释放页表但不释放叶子页表指向的物理页帧
++    //删去原来freewalk的else if (pte & PTE_V) {panic("freewalk: leaf");} 即可
++    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
++      // this PTE points to a lower-level page table.
++      uint64 child = PTE2PA(pte);
++      proc_free_k_pagetable((pagetable_t)child);
++      k_pagetable[i] = 0;
++    }
++  }
++  kfree((void *)k_pagetable);
++}
++
++
+ // a user program that calls exec("/init")
+ // od -t xC initcode
+ uchar initcode[] = {0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02, 0x97, 0x05, 0x00, 0x00, 0x93,
+@@ -202,6 +240,9 @@ void userinit(void) {
+ 
+   p->state = RUNNABLE;
+ 
++  //第一个进程也需要将用户页表映射到内核页表中（调用sync_pagetable函数）,见kernel/proc.c: userinit()
++  sync_pagetable(p->pagetable,p->k_pagetable,0,p->sz);
++
+   release(&p->lock);
+ }
+ 
+@@ -216,6 +257,8 @@ int growproc(int n) {
+     if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+       return -1;
+     }
++    //在growproc()中调用sync_pagetable将改变后的进程页表同步到内核页表中。
++    sync_pagetable(p->pagetable,p->k_pagetable,sz-n,sz);
+   } else if (n < 0) {
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
+@@ -262,6 +305,9 @@ int fork(void) {
+ 
+   np->state = RUNNABLE;
+ 
++  //在fork()中调用sync_pagetable将改变后的进程页表同步到内核页表中。
++  sync_pagetable(np->pagetable,np->k_pagetable,0,np->sz);
++
+   release(&np->lock);
+ 
+   return pid;
+@@ -412,6 +458,7 @@ int wait(uint64 addr) {
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++//修改调度器scheduler,使得切换进程的时候切换内核页表
+ void scheduler(void) {
+   struct proc *p;
+   struct cpu *c = mycpu();
+@@ -430,8 +477,18 @@ void scheduler(void) {
+         // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
++
++        //根据指导书step5的流程图可知时机
++        //借鉴kvminithart()的页表载入方式，在进程切换的同时也要切换页表将其放入寄存器satp中
++        w_satp(MAKE_SATP(p->k_pagetable));
++        sfence_vma();
++        //切换(第一个参数是old,第二个参数是new。Save current registers in old. Load from new.)
+         swtch(&c->context, &p->context);
+ 
++        //无进程运行的适配 ：当目前没有进程运行的时候，
++        //scheduler()应该要satp载入全局的内核页表kernel_pagetable (kernel/vm.c)，即kvminithart()
++        kvminithart();
++
+         // Process is done running for now.
+         // It should have changed its p->state before coming back.
+         c->proc = 0;
+@@ -623,3 +680,21 @@ void procdump(void) {
+     printf("\n");
+   }
+ }
++
++
++//写一个sync_pagetable函数把进程的用户页表映射到内核页表中，同时在defs.h中声明
++void sync_pagetable(pagetable_t user_pagetable,pagetable_t k_pagetable,uint64 start_va,uint64 end_va){
++    pte_t *user_pte;
++    pte_t *k_pte;
++    //遍历，把用户页表的页表项全部复制进内核页表
++    for(uint64 curr_va = start_va;curr_va<end_va;curr_va+=PGSIZE){
++      //首先把用户页表的pte地址读出来，对应alloc为0
++      user_pte = walk(user_pagetable,curr_va,0);
++      //再创建页面，对应alloc不为0，这里设置为1
++      k_pte = walk(k_pagetable,curr_va,1);
++      //把用户的页表项复制给内核页表项
++      *k_pte=*user_pte;
++      //这里需要修改标志位，把U标志位置为0，其他不变
++      *k_pte=*k_pte&0xFFFFFFFFFFFFFFEF;
++    }
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..40c3736 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,4 +103,8 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  //新增两个成员
++  pagetable_t k_pagetable;     // 给每个进程中设置一个内核独立页表
++  uint64 kstack_pa;            // 给每个进程中设置内核栈的物理地址
+ };
+diff --git a/kernel/vm.c b/kernel/vm.c
+index b794885..242a5ad 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -316,7 +316,7 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
+ // Copy len bytes to dst from virtual address srcva in a given page table.
+ // Return 0 on success, -1 on error.
+ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+-  uint64 n, va0, pa0;
++  /**uint64 n, va0, pa0;
+ 
+   while (len > 0) {
+     va0 = PGROUNDDOWN(srcva);
+@@ -330,7 +330,11 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+     dst += n;
+     srcva = va0 + PGSIZE;
+   }
+-  return 0;
++  return 0;*/
++
++  
++  //即删除copyin()原来的实现方案，直接在copyin()里调用函数 copyin_new() 。
++  return copyin_new(pagetable,dst,srcva,len);
+ }
+ 
+ // Copy a null-terminated string from user to kernel.
+@@ -338,7 +342,7 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+ // until a '\0', or max.
+ // Return 0 on success, -1 on error.
+ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
+-  uint64 n, va0, pa0;
++  /*uint64 n, va0, pa0;
+   int got_null = 0;
+ 
+   while (got_null == 0 && max > 0) {
+@@ -369,7 +373,13 @@ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
+     return 0;
+   } else {
+     return -1;
+-  }
++  }*/
++
++  
++  
++  //确保程序能运行之后再用copyinstr_new()以代替copyinstr()
++  return copyinstr_new(pagetable,dst,srcva,max);
++
+ }
+ 
+ // check if use global kpgtbl or not
+@@ -378,4 +388,136 @@ int test_pagetable() {
+   uint64 gsatp = MAKE_SATP(kernel_pagetable);
+   printf("test_pagetable: %d\n", satp != gsatp);
+   return satp != gsatp;
++}
++
++//flag，用于打印pagetable
++int flag=0;
++//tree_num指示层数
++int tree_num=0;
++//数组L存储虚拟地址中的L2,L1,L0
++int L[3];
++//把vmprint(pagetable_t pgtbl)放在kernel/vm.c,注意defs.h要加上它
++void vmprint(pagetable_t pgtbl){
++
++    //flag为0时打印pagetable，然后置flag为1
++    if(flag==0){
++      printf("page table %p\n",pgtbl);
++      flag=1;
++    }
++
++    //借鉴freewalk，循环进行
++    for(int i = 0; i < 512; i++){
++    pte_t pte = pgtbl[i]; //获取第i条PTE，注意i即为索引编号
++  
++    //判断PTE的Flag位，如果还有下一级页表，即当前是根页表或次页表
++    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){ 
++      // this PTE points to a lower-level page table.
++
++      //记录好每一层的Li值
++      L[tree_num]=i;
++
++      //将PTE转为物理地址
++      uint64 child = PTE2PA(pte); 
++      
++      //打印信息
++      //需要特别注意打印的格式！
++      //之前用str[4]打印出问号，可能是\0的原因。再用str[5]，打印出来看起来是一样了，但是过不了测试。
++      //然后再次修改打印方式为以下方式，终于通过。
++      if(tree_num==0){
++        printf("||idx: %d: pa: %p, flags: ",i,child);
++      }else if(tree_num==1){
++        printf("||   ||idx: %d: pa: %p, flags: ",i,child);
++      }
++
++      if(PTE_FLAGS(pte)&0x2){printf("r");}else{printf("-");}
++      if(PTE_FLAGS(pte)&0x4){printf("w");}else{printf("-");}
++      if(PTE_FLAGS(pte)&0x8){printf("x");}else{printf("-");}
++      if(PTE_FLAGS(pte)&0x10){printf("u");}else{printf("-");}
++      printf("\n");
++
++
++      //准备去下一层，层数加1
++      tree_num++;
++      //递归调用vmprint
++      vmprint((pagetable_t)child);
++      //出来之后层数减1
++      tree_num--;
++
++    } else if (pte & PTE_V) {
++      //如果叶子页表的虚拟地址还有映射到物理地址
++
++      //记录好每一层的Li值
++      L[tree_num]=i;
++
++      //将PTE转为物理地址
++      uint64 child = PTE2PA(pte);
++
++      //到达叶子节点时，各个Li应该已经收集好了，需要拼出虚拟地址va
++      //先初始化va为0
++      uint64 va=0x0;
++      //计算需要使用的各个量
++      uint64 L2=L[0] & 0x1FF;
++      uint64 L1=L[1] & 0x1FF;
++      uint64 L0=L[2] & 0x1FF;
++      //offset取物理地址的低12位
++      uint64 offset = child & 0xFFF;
++      //进行拼接，得到虚拟地址va
++      va=(L2<<30)+(L1<<21)+(L0<<12)+(offset);
++
++
++      //打印信息，特别注意打印格式！
++      printf("||   ||   ||idx: %d: va: %p -> pa: %p, flags: ",i,va,child);
++      if(PTE_FLAGS(pte)&0x2){printf("r");}else{printf("-");}
++      if(PTE_FLAGS(pte)&0x4){printf("w");}else{printf("-");}
++      if(PTE_FLAGS(pte)&0x8){printf("x");}else{printf("-");}
++      if(PTE_FLAGS(pte)&0x10){printf("u");}else{printf("-");}
++      printf("\n");
++
++    }
++  }
++}
++
++
++
++//仿照kvminit重写一个创建内核页表的函数，注意要在defs.h中加上它
++pagetable_t kvminit_new() {
++  //不要修改全局的内核页表（kernel/vm.c中的pagetable_t kernel_pagetable），
++  //而是直接创建一个新的内核页表，并将其地址k_pagetable返回。
++  pagetable_t k_pagetable=(pagetable_t)kalloc();
++  memset(k_pagetable, 0, PGSIZE);
++
++  //保留虚实地址相同的映射，kvmmap中第一个参数是虚地址，第二个参数是实地址
++  // uart registers
++  kvmmap_new(k_pagetable,UART0, UART0, PGSIZE, PTE_R | PTE_W);
++  
++
++  // virtio mmio disk interface
++  kvmmap_new(k_pagetable,VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
++
++  // 任务二,不要映射CLINT
++  //kvmmap(CLINT, CLINT, 0x10000, PTE_R | PTE_W);
++
++  //在独立内核页表加上用户页表的映射
++  kvmmap_new(k_pagetable,CLINT, CLINT, 0x10000, PTE_R | PTE_W);
++
++  // PLIC
++  kvmmap_new(k_pagetable,PLIC, PLIC, 0x400000, PTE_R | PTE_W);
++
++  // map kernel text executable and read-only.
++  kvmmap_new(k_pagetable,KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
++
++  // map kernel data and the physical RAM we'll make use of.
++  kvmmap_new(k_pagetable,(uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
++
++  // map the trampoline for trap entry/exit to
++  // the highest virtual address in the kernel.
++  kvmmap_new(k_pagetable,TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
++
++  
++  return k_pagetable;
++}
++
++//仿照kvmmap进行映射，但是页表要改成k_pagetable。记得在defs.h中加上它。
++void kvmmap_new(pagetable_t k_pagetable,uint64 va, uint64 pa, uint64 sz, int perm){
++    if (mappages(k_pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
+ }
+\ No newline at end of file

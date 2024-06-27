@@ -1,0 +1,230 @@
+diff --git a/Makefile b/Makefile
+index cac799d..65a91c4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -154,7 +154,9 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
++	$U/_sleep\
++	$U/_pingpong\
++	$U/_find\
+ 
+ ifeq ($(LAB),syscall)
+ UPROGS += \
+diff --git a/kernel/main.c b/kernel/main.c
+index 8a3dc2e..b695b87 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -9,8 +9,7 @@ volatile static int started = 0;
+ // start() jumps here in supervisor mode on all CPUs.
+ void main() {
+   if (cpuid() == 0) {
+-    // consoleinit();
+-    // printfinit();
++    printf("[210010101] enter main,init kernel\n");
+     printf("\n");
+     printf("xv6 kernel is booting\n");
+     printf("\n");
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 1607145..14d3698 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -183,6 +183,7 @@ uchar initcode[] = {0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02, 0x97, 0x05,
+ 
+ // Set up first user process.
+ void userinit(void) {
++  printf("[210010101] enter userinit\n");
+   struct proc *p;
+ 
+   p = allocproc();
+@@ -197,6 +198,7 @@ void userinit(void) {
+   p->trapframe->epc = 0;      // user program counter
+   p->trapframe->sp = PGSIZE;  // user stack pointer
+ 
++  printf("[210010101] copy initcode to first user process\n");
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+ 
+diff --git a/kernel/start.c b/kernel/start.c
+index f704fee..2c05cd0 100644
+--- a/kernel/start.c
++++ b/kernel/start.c
+@@ -52,8 +52,8 @@ void start() {
+     // init uart and printf
+     consoleinit();
+     printfinit();
+-  }
+-
++    printf("[210010101] in start,init driver,interrupts and change mode\n");}
++  
+   // switch to supervisor mode and jump to main().
+   asm volatile("mret");
+ }
+diff --git a/user/find.c b/user/find.c
+new file mode 100644
+index 0000000..ea68af5
+--- /dev/null
++++ b/user/find.c
+@@ -0,0 +1,73 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++
++char *file_name;    //命令行输入的文件名
++
++char *fmtname(char *path) {
++    char *p;
++
++    // Find first character after last slash.
++    for (p = path + strlen(path); p >= path && *p != '/'; p--)
++        ;
++    p++;
++    return p;   //文件名在最后一个斜杠后
++}
++
++void find(char *path) {
++    char buf[512], *p;
++    int fd;
++    struct dirent de;
++    struct stat st;
++
++    if ((fd = open(path, 0)) < 0) {
++        fprintf(2, "find: cannot open %s\n", path);
++        return;
++    }
++
++    if (fstat(fd, &st) < 0) {
++        fprintf(2, "find: cannot stat %s\n", path);
++        close(fd);
++        return;
++    }
++
++    switch (st.type) {
++        case T_FILE:
++            if (strcmp(fmtname(path), file_name) == 0) {  //比较找到的文件名和命令行输入的文件名，若相等则输出path  
++                printf("%s\n", path);
++            }
++            break;
++        case T_DIR:
++            if (strlen(path) + 1 + DIRSIZ + 1 > sizeof buf) {
++                printf("find: path too long\n");
++                break;
++            }
++            strcpy(buf, path);
++            p = buf + strlen(buf);
++            *p++ = '/';
++            while (read(fd, &de, sizeof(de)) == sizeof(de)) {
++                if (de.inum == 0||strcmp(de.name, "..") == 0||strcmp(de.name, ".") == 0)    //不要递归进入..和.
++                    continue;
++                memmove(p, de.name, DIRSIZ);
++                p[DIRSIZ] = 0;
++                if (stat(buf, &st) < 0) {
++                    printf("find: cannot stat %s\n", buf);
++                    continue;
++                }
++                find(buf);  //递归，find进入子目录查找
++            }
++            break;
++    }
++    close(fd);
++}
++
++int main(int argc, char *argv[]) {
++    if (argc != 3) {
++        printf("Find needs two arguments!\n");//检查参数数量是否正确
++        exit(-1);
++    }
++    file_name = argv[2];    //获取命令行输入的文件名
++    find(argv[1]);          //从当前路径查找
++    exit(0);    //确保进程退出
++}
+\ No newline at end of file
+diff --git a/user/init.c b/user/init.c
+index 9ca8790..1ea515e 100644
+--- a/user/init.c
++++ b/user/init.c
+@@ -23,6 +23,7 @@ int main(void) {
+ 
+   for (;;) {
+     printf("init: starting sh\n");
++    printf("[210010101] start sh through execve\n");
+     pid = fork();
+     if (pid < 0) {
+       printf("init: fork failed\n");
+diff --git a/user/pingpong.c b/user/pingpong.c
+new file mode 100644
+index 0000000..059f83e
+--- /dev/null
++++ b/user/pingpong.c
+@@ -0,0 +1,47 @@
++#include "kernel/types.h"
++#include "user.h"
++
++int main(int argc,char* argv[]){
++    if(argc!=1){
++        printf("Pingpong doesn't need arguments!\n");//检查参数数量是否正确
++        exit(-1);
++    }
++
++    int p1[2];
++    //int pi1;
++    //int pi1=pipe(p1); //创建管道，p1[1]为写入端，p1[0]为读出端
++    pipe(p1);
++
++    int p2[2];
++    //int pi2;
++    //pi2=pipe(p2); 
++    pipe(p2);
++
++    char buffer[8]={};
++
++    int ret = fork();
++    if(ret==0){         //子进程 
++        
++        close(p1[1]);    //关闭写端
++        read(p1[0],buffer,4);         //读取
++        printf("%d: received %s\n",getpid(),buffer); //打印信息
++        close(p1[0]);    //关闭读端
++        
++        close(p2[0]);    //关闭读端
++        write(p2[1],"pong",4);        //写入"pong"
++        close(p2[1]);   //关闭写端
++
++    }else if(ret>0){    //父进程
++        
++        close(p1[0]);    //关闭读端
++        write(p1[1],"ping",4);        //写入"ping"
++        close(p1[1]);    //关闭写端
++
++        close(p2[1]);    //关闭写端
++        read(p2[0],buffer,4);         //读取
++        printf("%d: received %s\n",getpid(),buffer); //打印信息
++        close(p2[0]);    //关闭读端
++
++    }
++    exit(0);    //确保进程退出
++  }
+\ No newline at end of file
+diff --git a/user/sleep.c b/user/sleep.c
+new file mode 100644
+index 0000000..51eac51
+--- /dev/null
++++ b/user/sleep.c
+@@ -0,0 +1,13 @@
++#include "kernel/types.h"
++#include "user.h"
++
++int main(int argc,char* argv[]){
++    if(argc!=2){
++        printf("Sleep needs one argument!\n");//检查参数数量是否正确
++        exit(-1);
++    }
++    int ticks = atoi(argv[1]); //将字符串参数转为整数
++    sleep(ticks);   //使用系统调用sleep
++    printf("(nothing happens for a little while)\n");
++    exit(0);    //确保进程退出
++}
+\ No newline at end of file

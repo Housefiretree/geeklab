@@ -1,0 +1,336 @@
+diff --git a/kernel/bio.c b/kernel/bio.c
+index 60d91a6..96c6106 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -23,14 +23,18 @@
+ #include "fs.h"
+ #include "buf.h"
+ 
++//构建磁盘缓存数据结构，构建13个哈希组
++#define NBUCKETS 13
+ struct {
+-  struct spinlock lock;
++  struct spinlock lock[NBUCKETS];
+   struct buf buf[NBUF];
+ 
+   // Linked list of all buffers, through prev/next.
+   // Sorted by how recently the buffer was used.
+   // head.next is most recent, head.prev is least.
+-  struct buf head;
++  //struct buf head;
++  struct buf hashbucket[NBUCKETS];  //每个哈希队列一个linked list及一个lock
++  struct spinlock total_lock;       //全局大锁
+ } bcache;
+ 
+ void
+@@ -38,18 +42,44 @@ binit(void)
+ {
+   struct buf *b;
+ 
+-  initlock(&bcache.lock, "bcache");
++  //initlock(&bcache.lock, "bcache");
++  //初始化全局大锁
++  initlock(&bcache.total_lock, "bcache_total_lock");
++  //循环初始化锁
++  int i=0;
++  for(i=0;i<NBUCKETS;i++){
++    initlock(&bcache.lock[i],"bcache_lock");
++  }
+ 
+   // Create linked list of buffers
+-  bcache.head.prev = &bcache.head;
+-  bcache.head.next = &bcache.head;
+-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
++  //bcache.head.prev = &bcache.head;
++  //bcache.head.next = &bcache.head;
++  
++  //循环创建linkedlist
++  for(i=0;i<NBUCKETS;i++){
++    bcache.hashbucket[i].prev = &bcache.hashbucket[i];
++    bcache.hashbucket[i].next = &bcache.hashbucket[i];
++  }
++
++  /**for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+     b->next = bcache.head.next;
+     b->prev = &bcache.head;
+     initsleeplock(&b->lock, "buffer");
+     bcache.head.next->prev = b;
+     bcache.head.next = b;
++  }*/
++
++  //buf
++  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
++    //使用哈希桶，将各块块号blockno的某种散列值作为key对块进行分组,这里选择取余
++    int b_hash_value = b->blockno % NBUCKETS;
++    b->next = bcache.hashbucket[b_hash_value].next;
++    b->prev = &bcache.hashbucket[b_hash_value];
++    initsleeplock(&b->lock, "buffer");
++    bcache.hashbucket[b_hash_value].next->prev = b;
++    bcache.hashbucket[b_hash_value].next = b;
+   }
++  
+ }
+ 
+ // Look through buffer cache for block on device dev.
+@@ -60,13 +90,19 @@ bget(uint dev, uint blockno)
+ {
+   struct buf *b;
+ 
+-  acquire(&bcache.lock);
++  //获取当前blockno对应的哈希值
++  int hash_value = blockno % NBUCKETS;
++  
++  //acquire(&bcache.lock);
++  //获取相应桶的锁
++  acquire(&bcache.lock[hash_value]);
+ 
+   // Is the block already cached?
+-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
++  //查看相应桶里的数据块
++  for(b = bcache.hashbucket[hash_value].next; b != &bcache.hashbucket[hash_value]; b = b->next){
+     if(b->dev == dev && b->blockno == blockno){
+       b->refcnt++;
+-      release(&bcache.lock);
++      release(&bcache.lock[hash_value]);
+       acquiresleep(&b->lock);
+       return b;
+     }
+@@ -74,17 +110,64 @@ bget(uint dev, uint blockno)
+ 
+   // Not cached.
+   // Recycle the least recently used (LRU) unused buffer.
+-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+-    if(b->refcnt == 0) {
+-      b->dev = dev;
+-      b->blockno = blockno;
+-      b->valid = 0;
+-      b->refcnt = 1;
+-      release(&bcache.lock);
+-      acquiresleep(&b->lock);
+-      return b;
++  //找相应桶的未使用的缓存块
++  for(b = bcache.hashbucket[hash_value].prev; b != &bcache.hashbucket[hash_value]; b = b->prev){
++      if(b->refcnt == 0) {
++          b->dev = dev;
++          b->blockno = blockno;
++          b->valid = 0;
++          b->refcnt = 1;
++          release(&bcache.lock[hash_value]);
++          acquiresleep(&b->lock);
++          return b;
++      }
++  }
++
++  //还没找到，需要从其他哈希桶找一个未被使用的缓存块，移入到相应的哈希桶链表中使用
++  //先释放这个锁
++  release(&bcache.lock[hash_value]);
++  //再获取全局大锁
++  acquire(&bcache.total_lock);
++  //获取原有桶的锁
++  acquire(&bcache.lock[hash_value]);
++  int i=0;
++  for(i=0;i<NBUCKETS;i++){
++    //检查的是其他桶
++    if(i!=hash_value){
++      //获取新桶的锁
++      acquire(&bcache.lock[i]);
++      //搜索缓存块且为未命中的缓存分配一个新条目，是原子操作
++      for(b = bcache.hashbucket[i].prev; b != &bcache.hashbucket[i]; b = b->prev){
++        //找到一个未使用的缓存块
++        if(b->refcnt == 0) {
++          b->dev = dev;
++          b->blockno = blockno;
++          b->valid = 0;
++          b->refcnt = 1;
++          //注意如果b移走，链表的指针需要改动
++          b->prev->next = b->next;
++          b->next->prev = b->prev;
++          //释放其他桶的锁
++          release(&bcache.lock[i]);
++          //需要把未使用的缓存块移入相应哈希桶链表中使用
++          b->next = bcache.hashbucket[hash_value].next;
++          b->prev = &bcache.hashbucket[hash_value];
++          bcache.hashbucket[hash_value].next->prev = b;
++          bcache.hashbucket[hash_value].next = b;
++          //释放原有桶的锁
++          release(&bcache.lock[hash_value]);
++          acquiresleep(&b->lock);
++          //释放全局大锁
++          release(&bcache.total_lock);
++          return b;
++        }
++      }
++      //释放新桶的锁
++      release(&bcache.lock[i]);
+     }
+   }
++  //释放全局大锁
++  release(&bcache.total_lock);
+   panic("bget: no buffers");
+ }
+ 
+@@ -121,33 +204,39 @@ brelse(struct buf *b)
+ 
+   releasesleep(&b->lock);
+ 
+-  acquire(&bcache.lock);
++  //相应的桶
++  int hash_value = b->blockno % NBUCKETS;
++  acquire(&bcache.lock[hash_value]);
+   b->refcnt--;
+   if (b->refcnt == 0) {
+     // no one is waiting for it.
+     b->next->prev = b->prev;
+     b->prev->next = b->next;
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    b->next = bcache.hashbucket[hash_value].next;
++    b->prev = &bcache.hashbucket[hash_value];
++    bcache.hashbucket[hash_value].next->prev = b;
++    bcache.hashbucket[hash_value].next = b;
+   }
+   
+-  release(&bcache.lock);
++  release(&bcache.lock[hash_value]);
+ }
+ 
+ void
+ bpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  //相应的桶
++  int hash_value = b->blockno % NBUCKETS;
++  acquire(&bcache.lock[hash_value]);
+   b->refcnt++;
+-  release(&bcache.lock);
++  release(&bcache.lock[hash_value]);
+ }
+ 
+ void
+ bunpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  //相应的桶
++  int hash_value = b->blockno % NBUCKETS;
++  acquire(&bcache.lock[hash_value]);
+   b->refcnt--;
+-  release(&bcache.lock);
++  release(&bcache.lock[hash_value]);
+ }
+ 
+ 
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..4410c7d 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -18,15 +18,23 @@ struct run {
+   struct run *next;
+ };
+ 
+-struct {
++//将kalloc的共享freelist改为每个CPU独立的freelist
++struct kmem{
+   struct spinlock lock;
+   struct run *freelist;
+-} kmem;
++};
++struct kmem kmems[NCPU];
+ 
+ void
+ kinit()
+ {
+-  initlock(&kmem.lock, "kmem");
++  //initlock(&kmem.lock, "kmem");
++  //循环初始化
++  int i=0;
++  for(i=0;i<NCPU;i++){
++    initlock(&kmems[i].lock,"kmem_lock");
++  }
++  //freerange为所有运行freerange的CPU分配空闲的内存,不用放在循环内
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -56,10 +64,18 @@ kfree(void *pa)
+ 
+   r = (struct run*)pa;
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++  //关中断
++  push_off();
++  //获取当前CPU的id号
++  int cpu_id = cpuid();
++  //先获得锁，然后释放内存块(将内存块放入当前CPU的freelist中)，再释放锁
++  acquire(&kmems[cpu_id].lock);
++  r->next = kmems[cpu_id].freelist;
++  kmems[cpu_id].freelist = r;
++  release(&kmems[cpu_id].lock);
++  //开中断
++  pop_off();
++
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -70,11 +86,47 @@ kalloc(void)
+ {
+   struct run *r;
+ 
+-  acquire(&kmem.lock);
+-  r = kmem.freelist;
+-  if(r)
+-    kmem.freelist = r->next;
+-  release(&kmem.lock);
++  //关中断
++  push_off();
++  //优先分配当前CPU的freelist内存块，首先要获取当前CPU的id
++  int now_cpu_id = cpuid();
++  //先获取当前cpu的锁，然后将其freelist赋给r
++  acquire(&kmems[now_cpu_id].lock);
++  r = kmems[now_cpu_id].freelist;
++  //如果r不为空，说明当前CPU的freelist有空闲块，分配
++  if(r){
++    kmems[now_cpu_id].freelist = r->next;
++    //释放锁且开中断
++    release(&kmems[now_cpu_id].lock);
++    pop_off();
++  }else{
++    //检查其他cpu的freelist进行窃取
++    //flag表示是否找到了满足条件的cpu
++    int i=0,flag=0;
++    for(i=0;i<NCPU;i++){
++      //flag为1则跳出循环
++      if(flag==1){
++        break;
++      }
++      //检查的是非当前cpu
++      if(i!=now_cpu_id){
++        //获取锁，将freelist赋给r
++        acquire(&kmems[i].lock);
++        r=kmems[i].freelist;
++        if(r){
++          //r不为空，就是找到了，分配
++          flag=1;
++          kmems[i].freelist=r->next;
++        }
++        //释放锁
++        release(&kmems[i].lock);
++      }
++    }
++    //释放锁且开中断
++    release(&kmems[now_cpu_id].lock);
++    pop_off();
++  }
++
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..7813681
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++5
+\ No newline at end of file

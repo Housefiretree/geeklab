@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/home/students/210010101/Scratches/user-land-filesystem/fs/demo/build",
+  "command": "/usr/bin/cc  -I/home/students/210010101/Scratches/user-land-filesystem/fs/demo/./include  -D_FILE_OFFSET_BITS=64 -no-pie -o CMakeFiles/demo.dir/src/main.c.o -c /home/students/210010101/Scratches/user-land-filesystem/fs/demo/src/main.c",
+  "file": "/home/students/210010101/Scratches/user-land-filesystem/fs/demo/src/main.c"
+}
+]

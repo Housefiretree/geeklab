@@ -1,0 +1,1 @@
+/usr/bin/cc  -D_FILE_OFFSET_BITS=64 -no-pie -rdynamic CMakeFiles/deadpoolfs.dir/src/deadpoolfs.c.o CMakeFiles/deadpoolfs.dir/src/deadpoolfs_utils.c.o CMakeFiles/deadpoolfs.dir/src/main.c.o -o deadpoolfs  -lfuse /home/students/210010101/lib/libddriver.a 

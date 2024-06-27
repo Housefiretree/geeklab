@@ -1,0 +1,181 @@
+diff --git a/Makefile b/Makefile
+index bf95a78..5e4c5ea 100644
+--- a/Makefile
++++ b/Makefile
+@@ -161,6 +161,7 @@ UPROGS=\
+ 	$U/_zombie\
+ 	$U/_waittest\
+ 	$U/_exittest\
++	$U/_yieldtest\
+ 
+ 
+ ifeq ($(LAB),trap)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index ecea5e6..3788f30 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -108,7 +108,7 @@ void            sched(void);
+ void            setproc(struct proc*);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+-int             wait(uint64);
++int             wait(uint64,int flags);
+ void            wakeup(void*);
+ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 1607145..a9e94c4 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -297,6 +297,9 @@ void reparent(struct proc *p) {
+ void exit(int status) {
+   struct proc *p = myproc();
+ 
++  enum state { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++  char *s[]={"unused","sleep","runble","run","zombie"};
++
+   if (p == initproc) panic("init exiting");
+ 
+   // Close all open files.
+@@ -336,8 +339,21 @@ void exit(int status) {
+   // the parent-then-child rule says we have to lock it first.
+   acquire(&original_parent->lock);
+ 
++  //打印父进程信息
++  exit_info("proc %d exit, parent pid %d, name %s, state %s\n",p->pid,original_parent->pid,original_parent->name,s[original_parent->state]);  
++
+   acquire(&p->lock);
+ 
++  //打印当前进程p的子进程信息
++  struct proc *pchild;
++  int child_cnt=0;
++  for (pchild = proc; pchild < &proc[NPROC]; pchild++) {
++    if (pchild->parent == p) {
++      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n",p->pid,child_cnt,pchild->pid,pchild->name,s[pchild->state]);
++      child_cnt++;
++    }
++  }
++
+   // Give any children to init.
+   reparent(p);
+ 
+@@ -356,7 +372,8 @@ void exit(int status) {
+ 
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+-int wait(uint64 addr) {
++//修改了wait函数
++int wait(uint64 addr,int flags) {
+   struct proc *np;
+   int havekids, pid;
+   struct proc *p = myproc();
+@@ -400,6 +417,15 @@ int wait(uint64 addr) {
+       return -1;
+     }
+ 
++    //printf("flags:%d\n",flags);
++    //flas为1时实现非阻塞逻辑
++    if(flags==1){
++      //返回之前需要解锁
++      release(&p->lock);
++      //返回-1
++      return -1; 
++    }
++
+     // Wait for a child to exit.
+     sleep(p, &p->lock);  // DOC: wait-sleep
+   }
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 4c97875..d8c058c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -89,6 +89,7 @@ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
+ extern uint64 sys_rename(void);
++extern uint64 sys_yield(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+     [SYS_fork] sys_fork,   [SYS_exit] sys_exit,     [SYS_wait] sys_wait,     [SYS_pipe] sys_pipe,
+@@ -96,7 +97,7 @@ static uint64 (*syscalls[])(void) = {
+     [SYS_chdir] sys_chdir, [SYS_dup] sys_dup,       [SYS_getpid] sys_getpid, [SYS_sbrk] sys_sbrk,
+     [SYS_sleep] sys_sleep, [SYS_uptime] sys_uptime, [SYS_open] sys_open,     [SYS_write] sys_write,
+     [SYS_mknod] sys_mknod, [SYS_unlink] sys_unlink, [SYS_link] sys_link,     [SYS_mkdir] sys_mkdir,
+-    [SYS_close] sys_close, [SYS_rename] sys_rename,
++    [SYS_close] sys_close, [SYS_rename] sys_rename, [SYS_yield]sys_yield,
+ };
+ 
+ void syscall(void) {
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 6998f87..52dbf42 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,4 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_rename 22
++#define SYS_yield  23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index a69071e..aa9dbb6 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -20,8 +20,11 @@ uint64 sys_fork(void) { return fork(); }
+ 
+ uint64 sys_wait(void) {
+   uint64 p;
++  int flags;
+   if (argaddr(0, &p) < 0) return -1;
+-  return wait(p);
++  //需要获取用户态传入的新参数
++  if (argint(1,&flags)<0) return -1;
++  return wait(p,flags);
+ }
+ 
+ uint64 sys_sbrk(void) {
+@@ -81,3 +84,17 @@ uint64 sys_rename(void) {
+   p->name[len] = '\0';
+   return 0;
+ }
++
++//内核部分：增加一个sys_yield函数，注意要在syscall.h里增加系统调用号：23
++uint64 sys_yield(void){
++  //获取用户上下文保存的PC值并打印
++  //根据proc.h，需要epc的值
++  uint64 pc;
++  struct proc *p = myproc();
++  pc=p->trapframe->epc;
++  printf("start to yield, user pc %p\n", pc);
++  //将当前进程挂起
++  yield();
++
++  return 0;
++}
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..62f9457
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ec47d9d..16dbc45 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ int rename(const char*);
++int yield(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 3a2f6c4..2918ba2 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -37,3 +37,4 @@ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
+ entry("rename");
++entry("yield");

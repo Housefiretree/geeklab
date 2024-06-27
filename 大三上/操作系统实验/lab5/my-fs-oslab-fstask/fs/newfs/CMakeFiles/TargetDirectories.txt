@@ -1,0 +1,3 @@
+/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/CMakeFiles/deadpoolfs.dir
+/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/CMakeFiles/edit_cache.dir
+/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/CMakeFiles/rebuild_cache.dir

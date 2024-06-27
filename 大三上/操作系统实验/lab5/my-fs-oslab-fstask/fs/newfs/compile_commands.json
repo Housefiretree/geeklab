@@ -1,0 +1,17 @@
+[
+{
+  "directory": "/home/students/210010101/Scratches/user-land-filesystem/fs/newfs",
+  "command": "/usr/bin/cc  -I/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/./include  -D_FILE_OFFSET_BITS=64 -no-pie -o CMakeFiles/deadpoolfs.dir/src/deadpoolfs.c.o -c /home/students/210010101/Scratches/user-land-filesystem/fs/newfs/src/deadpoolfs.c",
+  "file": "/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/src/deadpoolfs.c"
+},
+{
+  "directory": "/home/students/210010101/Scratches/user-land-filesystem/fs/newfs",
+  "command": "/usr/bin/cc  -I/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/./include  -D_FILE_OFFSET_BITS=64 -no-pie -o CMakeFiles/deadpoolfs.dir/src/deadpoolfs_utils.c.o -c /home/students/210010101/Scratches/user-land-filesystem/fs/newfs/src/deadpoolfs_utils.c",
+  "file": "/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/src/deadpoolfs_utils.c"
+},
+{
+  "directory": "/home/students/210010101/Scratches/user-land-filesystem/fs/newfs",
+  "command": "/usr/bin/cc  -I/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/./include  -D_FILE_OFFSET_BITS=64 -no-pie -o CMakeFiles/deadpoolfs.dir/src/main.c.o -c /home/students/210010101/Scratches/user-land-filesystem/fs/newfs/src/main.c",
+  "file": "/home/students/210010101/Scratches/user-land-filesystem/fs/newfs/src/main.c"
+}
+]
